@@ -1,6 +1,10 @@
 const ALLOWED_DOMAIN = "sankavollerei.web.id";
-const TIMEOUT_MS = 6000;
-const SECRET_KEY = ""; // Opsional: Samakan jika ingin dikunci
+const TIMEOUT_MS = 8000;
+const SECRET_KEY = ""; // Isi jika ingin dikunci dengan header x-proxy-key
+
+// Blokir bot/crawler langsung di level proxy agar kuota aman
+const BOT_UA_REGEX =
+  /bot|crawler|spider|crawling|scraper|reflection|claude|anthropic|gpt|chatgpt|oai-search|perplexity|facebookexternalhit|meta-externalagent|bytespider|petalbot|ahrefs|semrush|python|curl|wget|headless/i;
 
 function getNetlifyClientIp(req, context) {
   return (
@@ -14,8 +18,13 @@ function getNetlifyClientIp(req, context) {
 export default async (req, context) => {
   const startTime = Date.now();
   const clientIp = getNetlifyClientIp(req, context);
-  const clientUA = req.headers.get("user-agent") || "no-user-agent";
+  const clientUA = req.headers.get("user-agent") || "";
   const reqUrl = new URL(req.url);
+
+  // Abaikan request otomatis browser ke /favicon.ico agar tidak memenuhi log
+  if (reqUrl.pathname === "/favicon.ico") {
+    return new Response(null, { status: 204 });
+  }
 
   // 1. Handle CORS Preflight
   if (req.method === "OPTIONS") {
@@ -33,20 +42,23 @@ export default async (req, context) => {
 
   // 2. Tolak Method selain GET
   if (req.method !== "GET") {
-    console.warn(
-      `[BLOCKED METHOD] IP: ${clientIp} | Method: ${req.method} | UA: ${clientUA}`
-    );
     return new Response(JSON.stringify({ status: "method_not_allowed" }), {
       status: 405,
       headers: { "Content-Type": "application/json" },
     });
   }
 
-  // 3. Cek Kunci Rahasia (Jika diaktifkan)
+  // 3. Blokir Bot / Crawler
+  if (!clientUA || BOT_UA_REGEX.test(clientUA)) {
+    console.warn(`[BOT BLOCKED] IP: ${clientIp} | UA: ${clientUA}`);
+    return new Response(JSON.stringify({ status: "forbidden" }), {
+      status: 403,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  // 4. Cek Kunci Rahasia (Jika diaktifkan)
   if (SECRET_KEY && req.headers.get("x-proxy-key") !== SECRET_KEY) {
-    console.warn(
-      `[UNAUTHORIZED] IP: ${clientIp} | Target: ${reqUrl.search} | UA: ${clientUA}`
-    );
     return new Response(JSON.stringify({ status: "unauthorized" }), {
       status: 401,
       headers: { "Content-Type": "application/json" },
@@ -55,11 +67,8 @@ export default async (req, context) => {
 
   const targetUrl = reqUrl.searchParams.get("url");
 
-  // 4. Anti-Suspend Disguise + Log jika diakses tanpa ?url=
+  // 5. Response default jika diakses tanpa ?url=
   if (!targetUrl) {
-    console.log(
-      `[PING / ROOT] IP: ${clientIp} | Path: ${reqUrl.pathname} | UA: ${clientUA}`
-    );
     return new Response(
       JSON.stringify({ status: "online", service: "mangnime-komik-node" }),
       {
@@ -68,18 +77,15 @@ export default async (req, context) => {
           "Content-Type": "application/json",
           "Access-Control-Allow-Origin": "*",
         },
-      }
+      },
     );
   }
 
-  // 5. Validasi Ketat Hostname & Protokol HTTPS
+  // 6. Validasi Hostname & Protokol HTTPS
   let parsedTarget;
   try {
     parsedTarget = new URL(targetUrl);
   } catch {
-    console.warn(
-      `[INVALID URL] IP: ${clientIp} | Target: ${targetUrl} | UA: ${clientUA}`
-    );
     return new Response(JSON.stringify({ status: "invalid_request" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
@@ -89,36 +95,23 @@ export default async (req, context) => {
   const targetHost = parsedTarget.hostname;
   if (
     parsedTarget.protocol !== "https:" ||
-    (targetHost !== ALLOWED_DOMAIN && !targetHost.endsWith(`.${ALLOWED_DOMAIN}`))
+    (targetHost !== ALLOWED_DOMAIN &&
+      !targetHost.endsWith(`.${ALLOWED_DOMAIN}`))
   ) {
-    console.warn(
-      `[FORBIDDEN TARGET] IP: ${clientIp} | Mencoba akses ke: ${targetUrl} | UA: ${clientUA}`
-    );
     return new Response(JSON.stringify({ status: "restricted" }), {
       status: 403,
       headers: { "Content-Type": "application/json" },
     });
   }
 
-  // 6. Spoofed Headers Chrome 129
-  const spoofedHeaders = new Headers({
-    Host: targetHost,
+  // 7. Header Standar yang Konsisten
+  const requestHeaders = {
     Referer: `https://${targetHost}/`,
     "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    Accept:
-      "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    Accept: "application/json,text/plain,*/*",
     "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Sec-Ch-Ua":
-      '"Google Chrome";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-  });
+  };
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -126,7 +119,7 @@ export default async (req, context) => {
   try {
     const response = await fetch(parsedTarget.toString(), {
       method: "GET",
-      headers: spoofedHeaders,
+      headers: requestHeaders,
       redirect: "follow",
       signal: controller.signal,
     });
@@ -134,10 +127,15 @@ export default async (req, context) => {
     clearTimeout(timeoutId);
     const duration = Date.now() - startTime;
 
-    // LOG LENGKAP DI NETLIFY FUNCTION LOGS
     console.log(
-      `[NETLIFY OK ${response.status}] (${duration}ms) | IP: ${clientIp} | Akses: ${parsedTarget.pathname}${parsedTarget.search} | UA: ${clientUA}`
+      `[FUNC ${response.status}] (${duration}ms) | IP: ${clientIp} | Akses: ${parsedTarget.pathname}${parsedTarget.search}`,
     );
+
+    // Hanya simpan ke cache jika status 200 OK (agar 403 tidak nyangkut di cache)
+    const cacheHeader =
+      response.status === 200
+        ? "public, max-age=1800, s-maxage=1800, stale-while-revalidate=3600"
+        : "no-store, no-cache, must-revalidate";
 
     return new Response(response.body, {
       status: response.status,
@@ -146,18 +144,12 @@ export default async (req, context) => {
           response.headers.get("Content-Type") || "application/json",
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Cache-Control":
-          "public, max-age=1800, s-maxage=1800, stale-while-revalidate=3600",
+        "Cache-Control": cacheHeader,
       },
     });
   } catch (error) {
     clearTimeout(timeoutId);
-    const duration = Date.now() - startTime;
     const isTimeout = error.name === "AbortError";
-
-    console.error(
-      `[NETLIFY ERR ${isTimeout ? 504 : 502}] (${duration}ms) | IP: ${clientIp} | Akses: ${parsedTarget.pathname}${parsedTarget.search} | Err: ${error.message} | UA: ${clientUA}`
-    );
 
     return new Response(
       JSON.stringify({
@@ -169,8 +161,14 @@ export default async (req, context) => {
         headers: {
           "Content-Type": "application/json",
           "Access-Control-Allow-Origin": "*",
+          "Cache-Control": "no-store",
         },
-      }
+      },
     );
   }
+};
+
+// Routing untuk Netlify Serverless Functions v2
+export const config = {
+  path: "/*",
 };
